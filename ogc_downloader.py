@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 COOKIE_FILE = "cookies_ogc.json"
 BASE_DOWNLOAD_DIR = "downloads"
 MAX_RETRIES = 3
-HARDCODED_UPLOADER_URL = "https://agora.ogc.org/202610-uploader"  # Initialize portal session
+HARDCODED_UPLOADER_URL = "https://agora.ogc.org/202610-uploader"  # Initialize portal session, probably typo in URL, so hardcoded
 
 
 # -----------------------------
