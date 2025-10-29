@@ -1,12 +1,28 @@
+#!/usr/bin/env python3
+"""
+ogc_downloader.py
+
+Robust downloader for OGC AGORA / portal.ogc.org.
+
+Behavior:
+- Try to use saved cookies first.
+- If fetching the JSON returns 403 or invalid JSON, open Playwright for manual login:
+    * Visit agora
+    * Visit hardcoded uploader page (to initialize portal session)
+    * Visit the portal JSON URL (to ensure portal cookies exist)
+- Save cookies for both domains and the browser User-Agent
+- Retry fetching JSON and proceed to parallel downloads
+"""
+
 import json
 import os
 import time
+import argparse
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import requests
 from playwright.sync_api import sync_playwright
-import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # -----------------------------
 # Configuration
@@ -14,167 +30,302 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 COOKIE_FILE = "cookies_ogc.json"
 BASE_DOWNLOAD_DIR = "downloads"
 MAX_RETRIES = 3
-HARDCODED_UPLOADER_URL = "https://agora.ogc.org/202610-uploader"  # Initialize portal session, probably typo in URL, so hardcoded
+HARDCODED_UPLOADER_URL = "https://agora.ogc.org/202610-uploader"  # per your instruction (hardcoded)
+PORTAL_ROOT = "https://portal.ogc.org"
 
 
 # -----------------------------
-# 1️⃣ Authentication with Playwright
+# Utilities: save/load cookies + UA
 # -----------------------------
-def get_authenticated_session(agora_url="https://agora.ogc.org",
-                              uploader_url=HARDCODED_UPLOADER_URL,
-                              portal_url="https://portal.ogc.org",
-                              wait_time=40,
-                              headless=False):
+def save_cookies_and_ua(cookies, user_agent):
     """
-    Authenticate via Playwright, initialize portal session, and persist cookies.
+    Save Playwright cookies and user-agent to disk.
+    cookies: list of cookie dicts as returned by Playwright page.context.cookies()
+    user_agent: string
     """
-    session = requests.Session()
-
-    if os.path.exists(COOKIE_FILE):
-        print("🍪 Loading cookies from disk...")
-        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
-            cookies = json.load(f)
-        for c in cookies:
-            if "ogc.org" in c["domain"]:
-                session.cookies.set(c["name"], c["value"], domain=c["domain"])
-        test_resp = session.get(portal_url)
-        if test_resp.status_code == 200 and "login" not in test_resp.text.lower():
-            print("✅ Cookies valid, skipping login.")
-            return session
-        else:
-            print("⚠️ Cookies expired, manual login required.")
-
-    # Manual login via Playwright
-    print("🌐 Launching Playwright for AGORA authentication...")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        page = browser.new_page()
-
-        page.goto(agora_url)
-        print(f"➡️ Please login manually at {agora_url}")
-        print(f"⏳ Waiting {wait_time} seconds for login...")
-        time.sleep(wait_time)
-
-        # Initialize portal session
-        print(f"🌐 Visiting uploader page {uploader_url} to initialize portal session...")
-        page.goto(uploader_url)
-        time.sleep(5)
-
-        page.goto(portal_url)
-        time.sleep(5)
-
-        cookies = page.context.cookies()
-        browser.close()
-
+    payload = {"cookies": cookies, "user_agent": user_agent}
     with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-        json.dump(cookies, f, indent=2)
-    print(f"💾 Cookies saved to {COOKIE_FILE}")
+        json.dump(payload, f, indent=2)
+    print(f"💾 Cookies and UA saved to {COOKIE_FILE}")
 
+
+def load_cookies_and_ua():
+    """
+    Load cookies and user-agent from disk. Returns (cookies_list, user_agent) or (None, None).
+    """
+    if not os.path.exists(COOKIE_FILE):
+        return None, None
+    try:
+        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload.get("cookies", []), payload.get("user_agent")
+    except Exception as e:
+        print(f"⚠️ Failed to load cookies file: {e}")
+        return None, None
+
+
+def inject_cookies_into_session(session: requests.Session, cookies):
+    """
+    Inject Playwright cookies into requests.Session.
+    We attempt to set cookie domain as given; requests will send them accordingly.
+    """
     for c in cookies:
-        if "ogc.org" in c["domain"]:
-            session.cookies.set(c["name"], c["value"], domain=c["domain"])
-
-    return session
+        # Only keep cookies that have a name/value and domain
+        name = c.get("name")
+        value = c.get("value")
+        domain = c.get("domain")
+        path = c.get("path", "/")
+        if not (name and value and domain):
+            continue
+        # requests' cookies API: session.cookies.set(name, value, domain=domain, path=path)
+        try:
+            session.cookies.set(name, value, domain=domain, path=path)
+        except Exception:
+            # fallback: set without domain
+            session.cookies.set(name, value, path=path)
 
 
 # -----------------------------
-# 2️⃣ Fetch JSON file list
+# Authentication & cookie refresh logic
 # -----------------------------
-def fetch_file_list(session, month_code):
-    json_url = f"https://portal.ogc.org/upload/{month_code}/list_files.php"
-    print(f"📥 Fetching JSON from {json_url}")
-    resp = session.get(json_url)
+def try_use_saved_cookies_and_fetch_json(month_code, session, json_url):
+    """
+    Attempt to use saved cookies (already injected into session) and fetch JSON.
+    Returns (data_dict) on success or raises exception on failure.
+    """
+    print(f"📥 Attempting to fetch JSON from {json_url} using stored cookies...")
+    resp = session.get(json_url, allow_redirects=True)
+    # 403 or other non-200 likely means cookies invalid / session not initialized
+    if resp.status_code == 403:
+        raise Exception("403")
     if resp.status_code != 200:
-        raise Exception(f"❌ Failed to fetch JSON ({resp.status_code})")
+        raise Exception(f"HTTP {resp.status_code}")
     try:
         data = resp.json()
-    except json.JSONDecodeError:
-        raise Exception("❌ Response is not valid JSON — check authentication")
-    print(f"✅ JSON retrieved: {len(data.get('files', []))} files found")
+    except Exception:
+        raise Exception("InvalidJSON")
     return data
 
 
+def perform_playwright_login_and_save(month_code, agora_url, portal_json_url, headless=False, wait_time=40):
+    """
+    Launch Playwright for manual login, visit the uploader hardcoded URL and the portal JSON URL
+    so that cookies for both agora and portal domains are created. Save cookies + UA.
+    Returns the cookies list and user-agent string.
+    """
+    print("🌐 Launching Playwright for manual login and cookie sync...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context()
+        page = context.new_page()
+
+        # 1) go to agora and allow user to log in manually
+        page.goto(agora_url)
+        print(f"➡️ Please log in manually to {agora_url} (you have {wait_time} seconds)...")
+        # Wait for the user to finish login. We do a simple time.wait here; alternative is to wait for URL change or selector.
+        time.sleep(wait_time)
+
+        # 2) visit the hardcoded uploader URL to initialize the portal session (per your request)
+        try:
+            print(f"🌐 Visiting hardcoded uploader URL: {HARDCODED_UPLOADER_URL}")
+            page.goto(HARDCODED_UPLOADER_URL)
+            time.sleep(3)
+        except Exception as e:
+            print(f"⚠️ Visiting uploader page raised: {e}")
+
+        # 3) visit the portal JSON URL (so portal cookies are created/updated)
+        try:
+            print(f"🌐 Visiting portal JSON URL to ensure portal cookies: {portal_json_url}")
+            page.goto(portal_json_url)
+            # small pause to let any JS or redirects happen
+            time.sleep(3)
+        except Exception as e:
+            print(f"⚠️ Visiting portal JSON URL raised: {e}")
+
+        # collect cookies and user-agent
+        cookies = context.cookies()
+        user_agent = page.evaluate("() => navigator.userAgent")
+        browser.close()
+
+    # Save cookies + UA
+    save_cookies_and_ua(cookies, user_agent)
+    return cookies, user_agent
+
+
 # -----------------------------
-# 3️⃣ Download a single file with per-file progress bar
+# Fetch file list (with auto-refresh if needed)
 # -----------------------------
-def download_file(session, file_entry, month_code):
+def fetch_file_list_with_auto_refresh(session, month_code, agora_url, headless, wait_time):
+    """
+    Try saved cookies first. If they fail, open Playwright for manual login and retry.
+    Returns the parsed JSON data.
+    """
+    json_url = f"{PORTAL_ROOT}/upload/{month_code}/list_files.php"
+
+    # try to load cookies+ua from disk and inject them into session
+    cookies, ua = load_cookies_and_ua()
+    if cookies:
+        inject_cookies_into_session(session, cookies)
+    # set user-agent header if available (helps some backends)
+    if ua:
+        session.headers.update({"User-Agent": ua})
+
+    # Try to fetch JSON using stored cookies
+    try:
+        data = try_use_saved_cookies_and_fetch_json(month_code, session, json_url)
+        print("✅ Successfully fetched JSON using stored cookies.")
+        return data
+    except Exception as e:
+        print(f"⚠️ Stored cookies did not work ({e}). Will open browser to re-authenticate...")
+
+    # Run Playwright to re-authenticate and save cookies
+    cookies, ua = perform_playwright_login_and_save(month_code, agora_url, json_url, headless=headless, wait_time=wait_time)
+
+    # Inject refreshed cookies and UA into session
+    inject_cookies_into_session(session, cookies)
+    if ua:
+        session.headers.update({"User-Agent": ua})
+
+    # Retry fetching JSON
+    try:
+        data = try_use_saved_cookies_and_fetch_json(month_code, session, json_url)
+        print("✅ Successfully fetched JSON after manual login.")
+        return data
+    except Exception as e:
+        raise Exception(f"Failed to fetch JSON even after login: {e}")
+
+
+# -----------------------------
+# Downloading utilities
+# -----------------------------
+def clean_group_name(group_name):
+    safe_group = "".join(c if c.isalnum() or c in (" ", "_", "-", ".") else "_" for c in group_name)
+    return safe_group.strip().replace(" ", "_") or "Others"
+
+
+def download_single_file(session, file_entry, month_code):
+    """
+    Download a single file. Returns a short status string.
+    This function is safe to run in parallel threads.
+    """
     meta = file_entry.get("meta", {})
     original_name = meta.get("original_name")
     group_name = meta.get("group", "Others")
     server_size = file_entry.get("size", None)
 
     if not original_name:
-        return f"⚠️ File without 'original_name' skipped."
+        return "⚠️ File without original_name skipped."
 
-    safe_group = "".join(c if c.isalnum() or c in (" ", "_", "-", ".") else "_" for c in group_name).strip().replace(" ", "_")
+    safe_group = clean_group_name(group_name)
     group_dir = os.path.join(BASE_DOWNLOAD_DIR, safe_group)
     os.makedirs(group_dir, exist_ok=True)
     dest_path = os.path.join(group_dir, original_name)
 
+    # skip if present and size matches
+    # Skip if present and size matches; otherwise redownload
     if os.path.exists(dest_path) and server_size is not None:
         local_size = os.path.getsize(dest_path)
-        if local_size == server_size:
-            return f"⏭️ Skipping {original_name}, already downloaded ({local_size} bytes)"
+        if local_size >= server_size:
+            return f"⏭️ Skipped {original_name} (local size {local_size} >= server-reported size {server_size})"
+        else:
+            print(f"⚠️ Local file {original_name} smaller than server-reported size ({local_size} < {server_size}), re-downloading...")
 
-    download_url = f"https://portal.ogc.org/upload/{month_code}/getfile.php?id=" + quote(original_name)
+    download_url = f"{PORTAL_ROOT}/upload/{month_code}/getfile.php?id=" + quote(original_name)
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = session.get(download_url, stream=True)
+            resp = session.get(download_url, stream=True, timeout=60)
             if resp.status_code == 200:
+                # per-file progress bar (Content-Length may be missing)
                 total = int(resp.headers.get("Content-Length", 0))
+                # open file and stream write with progress
                 with open(dest_path, "wb") as f, tqdm(
-                    total=total, unit="B", unit_scale=True,
-                    desc=original_name, leave=False
+                    total=total, unit="B", unit_scale=True, leave=False,
+                    desc=original_name[:40]
                 ) as pbar:
                     for chunk in resp.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
                             pbar.update(len(chunk))
-                return f"✅ {original_name} → {safe_group}"
+                # after successful download, optionally verify size
+                if server_size is not None:
+                    local_size = os.path.getsize(dest_path)
+                    if local_size != server_size:
+                        return f"⚠️ Downloaded {original_name} but size mismatch (local {local_size} vs server {server_size})"
+                return f"✅ {original_name} -> {safe_group}"
             else:
-                msg = f"❌ Error {resp.status_code} downloading {original_name}"
+                msg = f"❌ HTTP {resp.status_code}"
         except Exception as e:
-            msg = f"❌ Exception on attempt {attempt}: {e}"
+            msg = f"❌ Exception: {e}"
 
         if attempt < MAX_RETRIES:
             time.sleep(2)
+            # small backoff
         else:
-            return f"⚠️ Failed to download {original_name} after {MAX_RETRIES} attempts"
+            return f"⚠️ Failed {original_name} after {MAX_RETRIES} attempts: {msg}"
 
 
-# -----------------------------
-# 4️⃣ Parallel download with per-file bars
-# -----------------------------
-def download_files_parallel(session, data, month_code, max_workers=5):
-    os.makedirs(BASE_DOWNLOAD_DIR, exist_ok=True)
+def download_files_in_parallel(session, data, month_code, max_workers=5):
+    """
+    Download files in parallel, with a global progress bar and per-file bars (per-file bars are set leave=False).
+    """
     files = data.get("files", [])
-    print(f"📦 Starting parallel download of {len(files)} files with {max_workers} workers...\n")
+    if not files:
+        print("ℹ️ No files to download.")
+        return
+
+    print(f"📦 Starting downloads: {len(files)} files with {max_workers} workers...\n")
+    os.makedirs(BASE_DOWNLOAD_DIR, exist_ok=True)
 
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(download_file, session, f, month_code): f for f in files}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Files overall"):
-            results.append(future.result())
+        futures = {executor.submit(download_single_file, session, f, month_code): f for f in files}
+        # overall progress using as_completed
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Overall files"):
+            try:
+                res = future.result()
+            except Exception as e:
+                res = f"⚠️ Worker exception: {e}"
+            results.append(res)
 
+    # print summary
+    print("\nSummary:")
     for r in results:
         print(r)
 
 
 # -----------------------------
-# 5️⃣ CLI
+# CLI and main flow
 # -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="OGC AGORA/PORTAL downloader with per-file progress bars")
-    parser.add_argument("--month", type=str, required=True, help="Month code to download (e.g., 202510)")
-    parser.add_argument("--headless", action="store_true", help="Run Playwright in headless mode")
-    parser.add_argument("--wait", type=int, default=40, help="Seconds to wait for manual login")
-    parser.add_argument("--workers", type=int, default=5, help="Number of parallel downloads")
+    parser = argparse.ArgumentParser(description="OGC AGORA / portal.ogc.org downloader (auto refresh cookies if needed)")
+    parser.add_argument("--month", required=True, help="Month code (e.g., 202510)")
+    parser.add_argument("--headless", action="store_true", help="Run Playwright in headless mode (no visible browser). Omit to show browser for manual login.")
+    parser.add_argument("--wait", type=int, default=40, help="Seconds to wait for manual login when Playwright opens (default: 40)")
+    parser.add_argument("--workers", type=int, default=5, help="Number of parallel downloads (default: 5)")
     args = parser.parse_args()
 
-    session = get_authenticated_session(wait_time=args.wait, headless=args.headless)
-    data = fetch_file_list(session, args.month)
-    download_files_parallel(session, data, args.month, max_workers=args.workers)
+    month_code = args.month
+    agora_url = "https://agora.ogc.org"
+    json_url = f"{PORTAL_ROOT}/upload/{month_code}/list_files.php"
+
+    # prepare requests session
+    session = requests.Session()
+    # sensible default headers
+    session.headers.update({
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+
+    # Fetch file list with auto refresh/relogin if needed
+    try:
+        data = fetch_file_list_with_auto_refresh(session, month_code, agora_url, headless=args.headless, wait_time=args.wait)
+    except Exception as e:
+        print(f"❌ Failed to get file list: {e}")
+        return
+
+    # Download files in parallel
+    download_files_in_parallel(session, data, month_code, max_workers=args.workers)
 
 
 if __name__ == "__main__":
