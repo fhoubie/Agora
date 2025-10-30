@@ -278,6 +278,11 @@ def download_files_in_parallel(session, data, month_code, max_workers=5):
     os.makedirs(BASE_DOWNLOAD_DIR, exist_ok=True)
 
     results = []
+    downloaded_files = []
+    skipped_files = []
+    failed_files = []
+    total_bytes = 0
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(download_single_file, session, f, month_code): f for f in files}
         # overall progress using as_completed
@@ -288,10 +293,39 @@ def download_files_in_parallel(session, data, month_code, max_workers=5):
                 res = f"⚠️ Worker exception: {e}"
             results.append(res)
 
-    # print summary
-    print("\nSummary:")
-    for r in results:
-        print(r)
+            # classify results
+            if res.startswith("✅"):
+                downloaded_files.append(res)
+                # try to extract file size for total
+                import re
+                m = re.search(r"\((\d+)\s*bytes?\)", res)
+                if m:
+                    total_bytes += int(m.group(1))
+            elif res.startswith("⏭️"):
+                skipped_files.append(res)
+            elif res.startswith(("⚠️", "❌")):
+                failed_files.append(res)
+
+        # print detailed summary
+    print("\n=== 🧾 Download Summary ===")
+    print(f"✅ Downloaded: {len(downloaded_files)} files")
+    print(f"⏭️ Skipped:    {len(skipped_files)} files")
+    print(f"⚠️ Failed:     {len(failed_files)} files")
+    print(f"📦 Total size downloaded: {total_bytes / 1_000_000:.2f} MB")
+
+    if failed_files:
+        print("\n⚠️ Failed files:")
+        for f in failed_files:
+            print(" -", f)
+
+    if downloaded_files:
+        print("\n✅ Downloaded files:")
+        for f in downloaded_files:
+            print(" -", f)
+
+    print("\n✅ All downloads complete.\n")
+
+
 
 
 # -----------------------------
