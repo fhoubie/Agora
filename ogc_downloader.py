@@ -30,7 +30,7 @@ from playwright.sync_api import sync_playwright
 COOKIE_FILE = "cookies_ogc.json"
 BASE_DOWNLOAD_DIR = "downloads"
 MAX_RETRIES = 3
-HARDCODED_UPLOADER_URL = "https://agora.ogc.org/202610-uploader"  # per your instruction (hardcoded)
+HARDCODED_UPLOADER_URL = "https://agora.ogc.org/202510-uploader"  # per your instruction (hardcoded)
 PORTAL_ROOT = "https://portal.ogc.org"
 
 
